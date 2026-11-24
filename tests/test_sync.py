@@ -65,12 +65,13 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(result.returncode, exit_code, f"{' '.join(args)}\n{result.stdout}{result.stderr}")
         return result.stdout
 
-    def install(self, name, configure=True):
+    def install(self, name, configure=True, *, auto_sync=False):
         install = self.root / name
         self.run_git(self.root, "clone", "--quiet", str(self.remote), str(install))
         (install / "home").mkdir()
         if configure:
-            self.run_cli(install, "user", "set", "diomedes")
+            flags = () if auto_sync else ("--no-auto-sync",)
+            self.run_cli(install, "user", "set", "diomedes", *flags)
         return install
 
     def fake_systemd(self):
@@ -130,6 +131,36 @@ class SyncTest(unittest.TestCase):
         self.run_cli(install, "user", "set", "diomedes")
         self.run_cli(install, "sync", "enable", "--fetch-only")
         self.assert_sync_service(units, install, "fetch")
+        remote_tip = self.run_git(install, "ls-remote", "origin", "refs/heads/main")
+        self.run_cli(install, "read", "15")
+        self.assertEqual(self.run_git(install, "ls-remote", "origin", "refs/heads/main"), remote_tip)
+
+    def test_auto_sync_pushes_reading_and_reset(self):
+        writer = self.install("writer", auto_sync=True)
+        reader = self.install("reader", auto_sync=True)
+
+        written = json.loads(self.run_cli(writer, "read", "25", "--note", "Test book", "--json"))
+        self.run_cli(reader, "sync", "fetch")
+        self.assertEqual(json.loads(self.run_cli(reader, "json")), written)
+        self.assertEqual(written["doneCount"], 1)
+
+        cleared = json.loads(self.run_cli(writer, "read", "reset", "--json"))
+        self.run_cli(reader, "sync", "fetch")
+        self.assertEqual(json.loads(self.run_cli(reader, "json")), cleared)
+        self.assertEqual(cleared["doneCount"], 0)
+
+    def test_auto_sync_keeps_local_reading_when_origin_is_unreachable(self):
+        writer = self.install("writer", auto_sync=True)
+        self.run_git(writer, "remote", "set-url", "origin", str(self.root / "missing.git"))
+
+        written = json.loads(self.run_cli(writer, "read", "25", "--json"))
+        self.assertEqual(json.loads(self.run_cli(writer, "json")), written)
+        self.assertEqual(written["doneCount"], 1)
+
+        self.run_git(writer, "remote", "set-url", "origin", str(self.remote))
+        self.run_cli(writer, "sync", "push")
+        reader = self.install("reader", auto_sync=True)
+        self.assertEqual(json.loads(self.run_cli(reader, "json")), written)
 
     def add_auto_pillar_history(self, install):
         home = install / "home"
@@ -207,8 +238,10 @@ class SyncTest(unittest.TestCase):
         reader = self.install("reader")
         yesterday = (self.today - datetime.timedelta(days=1)).isoformat()
         two_days_ago = (self.today - datetime.timedelta(days=2)).isoformat()
+        remote_tip = self.run_git(writer, "ls-remote", "origin", "refs/heads/main")
         self.run_cli(writer, "read", "12", "--date", two_days_ago)
         self.run_cli(writer, "read", "20")
+        self.assertEqual(self.run_git(writer, "ls-remote", "origin", "refs/heads/main"), remote_tip)
         self.run_cli(writer, "sync", "push")
 
         self.run_cli(other, "read", "30", "--date", yesterday)

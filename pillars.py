@@ -20,6 +20,7 @@ from pillars_history import (
     load_history,
     merge_reading,
     prefer_activity,
+    reading_auto_sync_enabled,
     set_history_user,
     sync_history,
     write_json,
@@ -583,6 +584,11 @@ def cmd_read(args: argparse.Namespace) -> None:
         "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="microseconds"),
     }
     save_reading_data(rdata)
+    if reading_auto_sync_enabled(DATA_DIR):
+        try:
+            sync_history(DATA_DIR, "push", gather_local_history())
+        except HistoryError as exc:
+            print(f"Reading saved locally. Auto-sync failed. {exc}", file=sys.stderr)
 
     if args.json:
         cmd_json(args)
@@ -616,9 +622,10 @@ def cmd_json(_args: argparse.Namespace) -> None:
 
 def cmd_user(args: argparse.Namespace) -> None:
     if args.user_action == "set":
-        set_history_user(DATA_DIR, args.user)
+        set_history_user(DATA_DIR, args.user, auto_sync=args.auto_sync)
     if history_is_configured(DATA_DIR):
-        print("Active user is diomedes. History sync is enabled.")
+        mode = "enabled" if reading_auto_sync_enabled(DATA_DIR) else "disabled"
+        print(f"Active user is diomedes. Auto-sync after reading is {mode}.")
     else:
         print("This install stores history locally. Run `pillars user set diomedes` to enable Git sync.")
 
@@ -627,11 +634,13 @@ def cmd_sync(args: argparse.Namespace) -> None:
     action = args.action or "push"
     if action == "disable":
         disable_schedule()
-        print("Disabled automatic history sync.")
+        print("Disabled the background sync timer.")
         return
     if not history_is_configured(DATA_DIR):
         raise HistoryError("Set up history sync first with `pillars user set diomedes`.")
     if action == "enable":
+        if args.fetch_only:
+            set_history_user(DATA_DIR, "diomedes", auto_sync=False)
         enable_schedule(ROOT_DIR / "pillars.py", "fetch" if args.fetch_only else "push")
         mode = "fetch-only sync" if args.fetch_only else "push and fetch"
         print(f"Scheduled automatic {mode} every 15 minutes and queued the first run.")
@@ -836,6 +845,7 @@ def build_parser() -> argparse.ArgumentParser:
     user_actions = p_user.add_subparsers(dest="user_action")
     set_user = user_actions.add_parser("set", help="Enable Git history sync for diomedes")
     set_user.add_argument("user", choices=("diomedes",))
+    set_user.add_argument("--no-auto-sync", dest="auto_sync", action="store_false", help="Save reading updates without pushing automatically")
     user_actions.add_parser("status", help="Show the active history user")
 
     p_sync = sub.add_parser("sync", help="Sync diomedes history")
@@ -844,7 +854,7 @@ def build_parser() -> argparse.ArgumentParser:
     actions.add_parser("fetch", help="Fetch history")
     enable = actions.add_parser("enable", help="Start automatic sync every 15 minutes with systemd")
     enable.add_argument("--fetch-only", action="store_true", help="Schedule fetching without pushing")
-    actions.add_parser("disable", help="Stop automatic sync")
+    actions.add_parser("disable", help="Stop the background sync timer")
 
     return parser
 

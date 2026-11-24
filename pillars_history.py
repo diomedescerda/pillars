@@ -98,6 +98,11 @@ def history_is_configured(data_dir):
     return isinstance(config, dict) and config.get("user") == PROFILE
 
 
+def reading_auto_sync_enabled(data_dir):
+    config = read_json(data_dir / "config.json", None)
+    return isinstance(config, dict) and config.get("user") == PROFILE and config.get("auto_sync") is True
+
+
 def reading_timestamp(entry):
     value = entry.get("updated_at")
     try:
@@ -143,10 +148,10 @@ def merge_history(local, other):
     return merged
 
 
-def set_history_user(data_dir, user):
+def set_history_user(data_dir, user, *, auto_sync=True):
     if user != PROFILE:
         raise HistoryError(f"History sync supports the {PROFILE} profile.")
-    write_json(data_dir / "config.json", {"user": user})
+    write_json(data_dir / "config.json", {"user": user, "auto_sync": auto_sync})
 
 
 def git(repo, *args, allow_failure=False):
@@ -156,8 +161,10 @@ def git(repo, *args, allow_failure=False):
     try:
         result = subprocess.run(
             ["git", *args], cwd=repo, env=env, capture_output=True, text=True,
-            encoding="utf-8", errors="replace",
+            encoding="utf-8", errors="replace", timeout=20,
         )
+    except subprocess.TimeoutExpired as exc:
+        raise HistoryError(f"Git {args[0]} timed out.") from exc
     except OSError as exc:
         raise HistoryError(f"Could not run Git: {exc}") from exc
     if result.returncode and not allow_failure:
