@@ -1,1 +1,6 @@
 /data/reading.json
+/data/history.json
+/data/config.json
+/data/users/*
+!/data/users/diomedes.json
+__pycache__/

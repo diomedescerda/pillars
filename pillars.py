@@ -5,14 +5,25 @@ Pulls live Proof of Work from Anki, grow, and speak, and tracks daily English re
 """
 
 import argparse
+from contextlib import closing
 import datetime
 import json
-import os
 import sqlite3
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+
+from pillars_history import (
+    HistoryError,
+    history_is_configured,
+    load_history,
+    merge_reading,
+    prefer_activity,
+    set_history_user,
+    sync_history,
+    write_json,
+)
 
 ROOT_DIR = Path(__file__).resolve().parent
 DATA_DIR = ROOT_DIR / "data"
@@ -23,6 +34,7 @@ GROW_DIR = Path.home() / "personal" / "growing"
 GROW_CONFIG = GROW_DIR / "data" / "config.json"
 GROW_USERS_DIR = GROW_DIR / "data" / "users"
 SPEAK_DIOMEDES_DB = Path.home() / "work" / "Speak" / "data" / "diomedes" / "speak.db"
+SPEAK_PERSONAL_DIOMEDES_DB = Path.home() / "personal" / "speak" / "data" / "diomedes" / "speak.db"
 SPEAK_LOCAL_DB = Path.home() / ".local" / "share" / "speak" / "speak.db"
 
 # TrueColor ANSI styling (zero emojis)
@@ -60,7 +72,7 @@ def today_str() -> str:
     return today_date().isoformat()
 
 
-def load_reading_data() -> Dict[str, Any]:
+def load_local_reading_data() -> Dict[str, Any]:
     if READING_FILE.exists():
         try:
             data = json.loads(READING_FILE.read_text(encoding="utf-8"))
@@ -73,9 +85,12 @@ def load_reading_data() -> Dict[str, Any]:
     return {"daily_goal_minutes": 0, "days": {}}
 
 
+def load_reading_data() -> Dict[str, Any]:
+    return merge_reading(load_local_reading_data(), load_history(DATA_DIR)["reading"])
+
+
 def save_reading_data(data: Dict[str, Any]) -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    READING_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    write_json(READING_FILE, data)
 
 
 # ---------------------------------------------------------------------------
@@ -165,9 +180,9 @@ def check_anki(d: Optional[datetime.date] = None) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # 2. MAJOR (GROW) PROOF OF WORK
 # ---------------------------------------------------------------------------
-def load_grow_state() -> Tuple[str, Dict[str, Any]]:
-    user = "diomedes"
-    if GROW_CONFIG.exists():
+def load_grow_profile(user: Optional[str] = None) -> Dict[str, Any]:
+    if user is None:
+        user = "diomedes"
         try:
             cfg = json.loads(GROW_CONFIG.read_text(encoding="utf-8"))
             user = cfg.get("user", "diomedes")
@@ -176,21 +191,30 @@ def load_grow_state() -> Tuple[str, Dict[str, Any]]:
     state_file = GROW_USERS_DIR / f"{user}.json"
     if not state_file.exists():
         state_file = GROW_USERS_DIR / "diomedes.json"
-    if not state_file.exists():
-        return "devops", {}
     try:
         state = json.loads(state_file.read_text(encoding="utf-8"))
-        active_track = state.get("active_track", "devops")
-        track_progress = state.get("tracks", {}).get(active_track, {})
-        return active_track, track_progress
+        return state if isinstance(state, dict) else {}
     except Exception:
+        return {}
+
+
+def load_grow_state(user: Optional[str] = None) -> Tuple[str, Dict[str, Any]]:
+    profile = load_grow_profile(user)
+    active_track = profile.get("active_track", "devops")
+    tracks = profile.get("tracks", {})
+    if not isinstance(active_track, str) or not isinstance(tracks, dict):
         return "devops", {}
+    progress = tracks.get(active_track, {})
+    return active_track, progress if isinstance(progress, dict) else {}
 
 
-def check_grow(d: Optional[datetime.date] = None) -> Dict[str, Any]:
+def check_grow(
+    d: Optional[datetime.date] = None,
+    state: Optional[Tuple[str, Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
     target_date = d or today_date()
     d_str = target_date.isoformat()
-    track_id, progress = load_grow_state()
+    track_id, progress = state if state is not None else load_grow_state()
 
     logs = [entry for entry in progress.get("daily_logs", []) if entry.get("date") == d_str]
     cur_day = progress.get("current_day", 1)
@@ -247,18 +271,17 @@ def check_grow(d: Optional[datetime.date] = None) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # 3. SPEAKING (SPEAK) PROOF OF WORK
 # ---------------------------------------------------------------------------
-def get_speak_db_path() -> Optional[Path]:
-    if SPEAK_DIOMEDES_DB.exists():
+def get_speak_db_path(scoped: bool = False) -> Optional[Path]:
+    if SPEAK_DIOMEDES_DB.is_file():
         return SPEAK_DIOMEDES_DB
-    if SPEAK_LOCAL_DB.exists():
-        return SPEAK_LOCAL_DB
-    return None
+    fallback = SPEAK_PERSONAL_DIOMEDES_DB if scoped else SPEAK_LOCAL_DB
+    return fallback if fallback.is_file() else None
 
 
-def check_speak(d: Optional[datetime.date] = None) -> Dict[str, Any]:
+def check_speak(d: Optional[datetime.date] = None, *, scoped: bool = False) -> Dict[str, Any]:
     target_date = d or today_date()
     d_str = target_date.isoformat()
-    db_path = get_speak_db_path()
+    db_path = get_speak_db_path(scoped)
 
     if not db_path:
         return {
@@ -273,10 +296,15 @@ def check_speak(d: Optional[datetime.date] = None) -> Dict[str, Any]:
 
     try:
         conn = sqlite3.connect(f"file:{db_path}?immutable=1", uri=True)
-        en_rows = conn.execute(
-            "SELECT duration_sec, wpm, review_json FROM attempts WHERE substr(created_at, 1, 10) = ? ORDER BY id DESC",
-            (d_str,),
-        ).fetchall()
+        en_rows = []
+        try:
+            en_rows = conn.execute(
+                "SELECT duration_sec, wpm, review_json FROM attempts WHERE substr(created_at, 1, 10) = ? ORDER BY id DESC",
+                (d_str,),
+            ).fetchall()
+        except sqlite3.OperationalError as exc:
+            if "no such table: attempts" not in str(exc):
+                raise
 
         ja_rows = []
         try:
@@ -376,15 +404,96 @@ def check_reading(d: Optional[datetime.date] = None, reading_data: Optional[Dict
 # ---------------------------------------------------------------------------
 # AGGREGATION & HISTORY
 # ---------------------------------------------------------------------------
-def get_day_summary(d: Optional[datetime.date] = None, reading_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def activity_dates(values: Iterable[Any]) -> Set[datetime.date]:
+    dates = set()
+    for value in values:
+        if isinstance(value, str):
+            try:
+                dates.add(datetime.date.fromisoformat(value))
+            except ValueError:
+                pass
+    return dates
+
+
+def sqlite_activity_dates(path: Optional[Path], *queries: str) -> Set[datetime.date]:
+    dates = set()
+    if path is None or not path.is_file():
+        return dates
+    try:
+        with closing(sqlite3.connect(f"{path.as_uri()}?immutable=1", uri=True)) as connection:
+            for query in queries:
+                try:
+                    dates.update(activity_dates(row[0] for row in connection.execute(query)))
+                except sqlite3.OperationalError as exc:
+                    if "no such table:" not in str(exc):
+                        raise
+    except sqlite3.Error as exc:
+        raise HistoryError(f"Could not read activity dates from {path.name}. {exc}") from exc
+    return dates
+
+
+def gather_local_history() -> Dict[str, Any]:
+    days: Dict[str, Dict[str, Any]] = {}
+    for date in sqlite_activity_dates(
+        ANKI_DB,
+        "SELECT DISTINCT date(id / 1000, 'unixepoch', 'localtime', '-4 hours') FROM revlog",
+    ):
+        activity = check_anki(date)
+        if activity["reviews"]:
+            days.setdefault(date.isoformat(), {})["anki"] = activity
+
+    profile = load_grow_profile("diomedes")
+    active_track = profile.get("active_track", "devops")
+    tracks = profile.get("tracks", {})
+    if isinstance(tracks, dict):
+        for track in sorted(tracks, key=lambda track: (track != active_track, track)):
+            progress = tracks[track]
+            if not isinstance(progress, dict):
+                continue
+            dates = activity_dates(entry.get("date") for entry in progress.get("daily_logs", []))
+            dates.update(activity_dates(entry.get("completed_at") for entry in progress.get("completed_days", {}).values()))
+            for date in dates:
+                activity = check_grow(date, (track, progress))
+                if activity["done"]:
+                    days.setdefault(date.isoformat(), {}).setdefault("major", activity)
+
+    for date in sqlite_activity_dates(
+        get_speak_db_path(scoped=True),
+        "SELECT DISTINCT substr(created_at, 1, 10) FROM attempts",
+        "SELECT DISTINCT substr(created_at, 1, 10) FROM ja_attempts",
+    ):
+        activity = check_speak(date, scoped=True)
+        if activity["attempts"]:
+            days.setdefault(date.isoformat(), {})["speak"] = activity
+
+    return {"version": 1, "user": "diomedes", "reading": load_local_reading_data(), "days": days}
+
+
+def get_day_summary(
+    d: Optional[datetime.date] = None,
+    reading_data: Optional[Dict[str, Any]] = None,
+    synced_history: Optional[Dict[str, Any]] = None,
+    grow_state: Optional[Tuple[str, Dict[str, Any]]] = None,
+    *,
+    scoped: Optional[bool] = None,
+) -> Dict[str, Any]:
     target_date = d or today_date()
-    rdata = reading_data if reading_data is not None else load_reading_data()
+    if synced_history is None:
+        synced_history = load_history(DATA_DIR)
+    if reading_data is None:
+        reading_data = merge_reading(load_local_reading_data(), synced_history["reading"])
+    if scoped is None:
+        scoped = history_is_configured(DATA_DIR)
+    if grow_state is None:
+        grow_state = load_grow_state("diomedes" if scoped else None)
+    recorded = synced_history["days"].get(target_date.isoformat(), {})
     items = [
         check_anki(target_date),
-        check_grow(target_date),
-        check_speak(target_date),
-        check_reading(target_date, rdata),
+        check_grow(target_date, grow_state),
+        check_speak(target_date, scoped=scoped),
+        check_reading(target_date, reading_data),
     ]
+    items = [prefer_activity(item, recorded[item["id"]]) if item["id"] in recorded else item for item in items]
     done_count = sum(1 for it in items if it["done"])
     return {
         "date": target_date.isoformat(),
@@ -397,12 +506,15 @@ def get_day_summary(d: Optional[datetime.date] = None, reading_data: Optional[Di
 
 def compute_history_and_streaks(days_back: int = 28) -> Tuple[int, Dict[str, int], List[Dict[str, Any]]]:
     """Returns (full_4_of_4_streak, per_pillar_streaks, last_N_days_summaries)."""
-    rdata = load_reading_data()
+    synced_history = load_history(DATA_DIR)
+    rdata = merge_reading(load_local_reading_data(), synced_history["reading"])
+    scoped = history_is_configured(DATA_DIR)
+    grow_state = load_grow_state("diomedes" if scoped else None)
     today = today_date()
     history: List[Dict[str, Any]] = []
     for offset in range(days_back - 1, -1, -1):
         d = today - datetime.timedelta(days=offset)
-        history.append(get_day_summary(d, rdata))
+        history.append(get_day_summary(d, rdata, synced_history, grow_state, scoped=scoped))
 
     # Compute full 4/4 streak (counting today if 4/4, else starting from yesterday)
     full_streak = 0
@@ -436,10 +548,10 @@ def compute_history_and_streaks(days_back: int = 28) -> Tuple[int, Dict[str, int
 # ---------------------------------------------------------------------------
 def cmd_read(args: argparse.Namespace) -> None:
     raw = (args.minutes or "").strip()
-    rdata = load_reading_data()
-    d_str = args.date or today_str()
-    days = rdata.setdefault("days", {})
-    cur_entry = days.get(d_str, {"minutes": 0, "note": "", "updated_at": ""})
+    rdata = load_local_reading_data()
+    synced = load_history(DATA_DIR)["reading"]
+    d_str = args.date.isoformat() if args.date else today_str()
+    cur_entry = merge_reading(rdata, synced)["days"].get(d_str, {})
     cur_mins = int(cur_entry.get("minutes", 0) or 0)
 
     if raw.lower() in ("reset", "clear", "0"):
@@ -464,10 +576,10 @@ def cmd_read(args: argparse.Namespace) -> None:
             sys.exit(1)
 
     note = args.note if args.note is not None else cur_entry.get("note", "")
-    days[d_str] = {
+    rdata["days"][d_str] = {
         "minutes": new_mins,
         "note": note,
-        "updated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="microseconds"),
     }
     save_reading_data(rdata)
 
@@ -483,8 +595,8 @@ def cmd_read(args: argparse.Namespace) -> None:
 
 
 def cmd_json(_args: argparse.Namespace) -> None:
-    today_sum = get_day_summary(today_date())
     full_streak, per_pillar, history = compute_history_and_streaks(14)
+    today_sum = history[-1]
     payload = {
         "date": today_sum["date"],
         "doneCount": today_sum["done_count"],
@@ -499,6 +611,25 @@ def cmd_json(_args: argparse.Namespace) -> None:
         ],
     }
     print(json.dumps(payload, ensure_ascii=False))
+
+
+def cmd_user(args: argparse.Namespace) -> None:
+    if args.user_action == "set":
+        set_history_user(DATA_DIR, args.user)
+    if history_is_configured(DATA_DIR):
+        print("Active user is diomedes. History sync is enabled.")
+    else:
+        print("This install stores history locally. Run `pillars user set diomedes` to enable Git sync.")
+
+
+def cmd_sync(args: argparse.Namespace) -> None:
+    if not history_is_configured(DATA_DIR):
+        raise HistoryError("Set up history sync first with `pillars user set diomedes`.")
+    local_history = gather_local_history() if args.action == "push" else None
+    history = sync_history(DATA_DIR, args.action, local_history)
+    date_count = len(history["days"].keys() | history["reading"]["days"].keys())
+    verb = "Pushed" if args.action == "push" else "Fetched"
+    print(f"{verb} diomedes history covering {date_count} days.")
 
 
 def _strip_ansi(s: str) -> str:
@@ -519,8 +650,8 @@ def _pad(s: str, width: int, align: str = "left") -> str:
 
 def cmd_status(_args: argparse.Namespace) -> None:
     DAYS_SPAN = 35
-    today_sum = get_day_summary(today_date())
     full_streak, per_pillar, history = compute_history_and_streaks(DAYS_SPAN)
+    today_sum = history[-1]
     done_c = today_sum["done_count"]
     W = 96  # Larger inner width
 
@@ -687,8 +818,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_read = sub.add_parser("read", help="Log minutes spent reading in English today")
     p_read.add_argument("minutes", help="Minutes read (e.g. '35', '+15', '-10', or 'reset')")
     p_read.add_argument("-n", "--note", help="Optional book title or note", default=None)
-    p_read.add_argument("-d", "--date", help="Optional YYYY-MM-DD date (defaults to today)", default=None)
+    p_read.add_argument("-d", "--date", type=datetime.date.fromisoformat, help="Optional YYYY-MM-DD date (defaults to today)")
     p_read.add_argument("--json", action="store_true", help="Output updated JSON state after logging")
+
+    p_user = sub.add_parser("user", help="Set or show the active history user")
+    user_actions = p_user.add_subparsers(dest="user_action")
+    set_user = user_actions.add_parser("set", help="Enable Git history sync for diomedes")
+    set_user.add_argument("user", choices=("diomedes",))
+    user_actions.add_parser("status", help="Show the active history user")
+
+    p_sync = sub.add_parser("sync", help="Push or fetch diomedes history")
+    p_sync.add_argument("action", choices=("push", "fetch"), nargs="?", default="push", help="Sync action (default: push)")
 
     return parser
 
@@ -696,15 +836,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
-    cmd = args.command or "status"
-    if cmd == "status":
-        cmd_status(args)
-    elif cmd == "json":
-        cmd_json(args)
-    elif cmd == "read":
-        cmd_read(args)
-    else:
-        cmd_status(args)
+    commands = {"status": cmd_status, "json": cmd_json, "read": cmd_read, "user": cmd_user, "sync": cmd_sync}
+    try:
+        commands[args.command or "status"](args)
+    except HistoryError as exc:
+        parser.exit(1, f"pillars: {exc}\n")
 
 
 if __name__ == "__main__":
