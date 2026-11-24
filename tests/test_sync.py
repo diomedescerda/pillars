@@ -2,6 +2,7 @@ import datetime
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -52,7 +53,7 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, f"git {' '.join(args)}\n{result.stdout}{result.stderr}")
         return result.stdout
 
-    def run_cli(self, install, *args):
+    def run_cli(self, install, *args, exit_code=0):
         result = subprocess.run(
             [sys.executable, "pillars.py", *args],
             cwd=install,
@@ -61,15 +62,74 @@ class SyncTest(unittest.TestCase):
             text=True,
             timeout=20,
         )
-        self.assertEqual(result.returncode, 0, f"{' '.join(args)}\n{result.stdout}{result.stderr}")
+        self.assertEqual(result.returncode, exit_code, f"{' '.join(args)}\n{result.stdout}{result.stderr}")
         return result.stdout
 
-    def install(self, name):
+    def install(self, name, configure=True):
         install = self.root / name
         self.run_git(self.root, "clone", "--quiet", str(self.remote), str(install))
         (install / "home").mkdir()
-        self.run_cli(install, "user", "set", "diomedes")
+        if configure:
+            self.run_cli(install, "user", "set", "diomedes")
         return install
+
+    def fake_systemd(self):
+        commands = self.root / "commands.jsonl"
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        systemctl = bin_dir / "systemctl"
+        systemctl.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, sys\n"
+            "with open(os.environ['SYSTEMCTL_LOG'], 'a', encoding='utf-8') as log:\n"
+            "    log.write(json.dumps(sys.argv[1:]) + '\\n')\n",
+            encoding="utf-8",
+        )
+        systemctl.chmod(0o755)
+        self.environment["PATH"] = os.pathsep.join((str(bin_dir), self.environment.get("PATH", os.defpath)))
+        self.environment["SYSTEMCTL_LOG"] = str(commands)
+        self.environment.pop("XDG_CONFIG_HOME", None)
+        return commands
+
+    def assert_sync_service(self, units, install, action):
+        service = (units / "pillars-sync.service").read_text(encoding="utf-8")
+        exec_start = next(line for line in service.splitlines() if line.startswith("ExecStart="))
+        command = shlex.split(exec_start.removeprefix("ExecStart="))
+        self.assertEqual(command[-3:], [str(install / "pillars.py"), "sync", action])
+
+    def test_enable_and_disable_scheduled_push(self):
+        install = self.install("writer clone")
+        commands = self.fake_systemd()
+        config = self.root / "xdg-config"
+        self.environment["XDG_CONFIG_HOME"] = str(config)
+        units = config / "systemd/user"
+
+        self.run_cli(install, "sync", "enable")
+
+        self.assert_sync_service(units, install, "push")
+        timer = (units / "pillars-sync.timer").read_text(encoding="utf-8")
+        self.assertRegex(timer, r"(?m)^OnCalendar=.*(?:/15|00,15,30,45)")
+        self.assertIn("Persistent=true", timer)
+        self.run_cli(install, "sync", "disable")
+        self.assertEqual([json.loads(line) for line in commands.read_text(encoding="utf-8").splitlines()], [
+            ["--user", "daemon-reload"],
+            ["--user", "enable", "--now", "pillars-sync.timer"],
+            ["--user", "start", "--no-block", "pillars-sync.service"],
+            ["--user", "disable", "--now", "pillars-sync.timer"],
+        ])
+
+    def test_schedule_fetch_only_requires_selected_user(self):
+        install = self.install("reader", configure=False)
+        commands = self.fake_systemd()
+        units = install / "home/.config/systemd/user"
+
+        self.run_cli(install, "sync", "enable", "--fetch-only", exit_code=1)
+        self.assertFalse(commands.exists())
+        self.assertFalse(units.exists())
+
+        self.run_cli(install, "user", "set", "diomedes")
+        self.run_cli(install, "sync", "enable", "--fetch-only")
+        self.assert_sync_service(units, install, "fetch")
 
     def add_auto_pillar_history(self, install):
         home = install / "home"

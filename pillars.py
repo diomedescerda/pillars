@@ -24,6 +24,7 @@ from pillars_history import (
     sync_history,
     write_json,
 )
+from pillars_schedule import disable_schedule, enable_schedule
 
 ROOT_DIR = Path(__file__).resolve().parent
 DATA_DIR = ROOT_DIR / "data"
@@ -623,12 +624,22 @@ def cmd_user(args: argparse.Namespace) -> None:
 
 
 def cmd_sync(args: argparse.Namespace) -> None:
+    action = args.action or "push"
+    if action == "disable":
+        disable_schedule()
+        print("Disabled automatic history sync.")
+        return
     if not history_is_configured(DATA_DIR):
         raise HistoryError("Set up history sync first with `pillars user set diomedes`.")
-    local_history = gather_local_history() if args.action == "push" else None
-    history = sync_history(DATA_DIR, args.action, local_history)
+    if action == "enable":
+        enable_schedule(ROOT_DIR / "pillars.py", "fetch" if args.fetch_only else "push")
+        mode = "fetch-only sync" if args.fetch_only else "push and fetch"
+        print(f"Scheduled automatic {mode} every 15 minutes and queued the first run.")
+        return
+    local_history = gather_local_history() if action == "push" else None
+    history = sync_history(DATA_DIR, action, local_history)
     date_count = len(history["days"].keys() | history["reading"]["days"].keys())
-    verb = "Pushed" if args.action == "push" else "Fetched"
+    verb = "Pushed" if action == "push" else "Fetched"
     print(f"{verb} diomedes history covering {date_count} days.")
 
 
@@ -827,8 +838,13 @@ def build_parser() -> argparse.ArgumentParser:
     set_user.add_argument("user", choices=("diomedes",))
     user_actions.add_parser("status", help="Show the active history user")
 
-    p_sync = sub.add_parser("sync", help="Push or fetch diomedes history")
-    p_sync.add_argument("action", choices=("push", "fetch"), nargs="?", default="push", help="Sync action (default: push)")
+    p_sync = sub.add_parser("sync", help="Sync diomedes history")
+    actions = p_sync.add_subparsers(dest="action")
+    actions.add_parser("push", help="Fetch, merge, and push history (default)")
+    actions.add_parser("fetch", help="Fetch history")
+    enable = actions.add_parser("enable", help="Start automatic sync every 15 minutes with systemd")
+    enable.add_argument("--fetch-only", action="store_true", help="Schedule fetching without pushing")
+    actions.add_parser("disable", help="Stop automatic sync")
 
     return parser
 
