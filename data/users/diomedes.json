@@ -10916,6 +10916,18 @@
         "title": "Study Major (grow)",
         "track": "devops"
       }
+    },
+    "2026-11-25": {
+      "anki": {
+        "auto": true,
+        "detail": "182 cards • 24m (0 due)",
+        "done": true,
+        "due_remaining": 0,
+        "id": "anki",
+        "minutes": 24.2,
+        "reviews": 182,
+        "title": "Anki"
+      }
     }
   },
   "reading": {
