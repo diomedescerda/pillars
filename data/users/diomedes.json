@@ -10932,12 +10932,12 @@
     "2026-11-26": {
       "anki": {
         "auto": true,
-        "detail": "86 done (21m) • 44 due left",
-        "done": false,
-        "due_remaining": 44,
+        "detail": "195 cards • 39m (0 due)",
+        "done": true,
+        "due_remaining": 0,
         "id": "anki",
-        "minutes": 20.6,
-        "reviews": 86,
+        "minutes": 38.8,
+        "reviews": 195,
         "title": "Anki"
       }
     }
