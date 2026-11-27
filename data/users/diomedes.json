@@ -10940,6 +10940,18 @@
         "reviews": 195,
         "title": "Anki"
       }
+    },
+    "2026-11-27": {
+      "anki": {
+        "auto": true,
+        "detail": "55 done (12m) • 47 due left",
+        "done": false,
+        "due_remaining": 47,
+        "id": "anki",
+        "minutes": 12.3,
+        "reviews": 55,
+        "title": "Anki"
+      }
     }
   },
   "reading": {
