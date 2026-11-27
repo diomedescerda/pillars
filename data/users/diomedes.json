@@ -10944,12 +10944,12 @@
     "2026-11-27": {
       "anki": {
         "auto": true,
-        "detail": "55 done (12m) • 47 due left",
+        "detail": "135 done (27m) • 42 due left",
         "done": false,
-        "due_remaining": 47,
+        "due_remaining": 42,
         "id": "anki",
-        "minutes": 12.3,
-        "reviews": 55,
+        "minutes": 26.8,
+        "reviews": 135,
         "title": "Anki"
       }
     }
