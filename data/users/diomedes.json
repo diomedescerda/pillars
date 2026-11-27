@@ -10951,6 +10951,17 @@
         "minutes": 31.4,
         "reviews": 224,
         "title": "Anki"
+      },
+      "major": {
+        "auto": true,
+        "day": 7,
+        "detail": "DEVOPS Day 7 • 100% (+125 XP)",
+        "done": true,
+        "id": "major",
+        "note": "pretty insighful to know better about tar",
+        "score": 100,
+        "title": "Study Major (grow)",
+        "track": "devops"
       }
     }
   },
